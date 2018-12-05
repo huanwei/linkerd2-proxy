@@ -7,7 +7,7 @@
 # This reduces build time and produces binaries with debug symbols, at the expense of
 # runtime performance.
 
-ARG RUST_IMAGE=rust:1.28.0
+ARG RUST_IMAGE=rust:1.30.0
 ARG RUNTIME_IMAGE=gcr.io/linkerd-io/base:2017-10-30.01
 
 ## Builds the proxy as incrementally as possible.
@@ -16,20 +16,12 @@ FROM $RUST_IMAGE as build
 WORKDIR /usr/src/linkerd2-proxy
 
 # Fetch external dependencies.
-#
-# Mock out all local code and fetch external dependencies to ensure that
-# external sources are primarily cached on Cargo.lock.
-RUN for d in . futures-mpsc-lossy router ; \
-    do mkdir -p "${d}/src" && touch "${d}/src/lib.rs" ; \
-    done
-COPY Cargo.toml Cargo.lock          ./
-COPY futures-mpsc-lossy/Cargo.toml  futures-mpsc-lossy/Cargo.toml
-COPY router/Cargo.toml              router/Cargo.toml
+RUN mkdir -p src && touch src/lib.rs
+COPY Cargo.toml Cargo.lock ./
+COPY lib lib
 RUN cargo fetch --locked
 
 # Build libraries, leaving the proxy mocked out.
-COPY futures-mpsc-lossy futures-mpsc-lossy
-COPY router router
 ARG PROXY_UNOPTIMIZED
 RUN if [ -n "$PROXY_UNOPTIMIZED" ]; \
     then cargo build --frozen ; \

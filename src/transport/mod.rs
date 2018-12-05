@@ -1,7 +1,8 @@
-mod connect;
+pub mod connect;
 mod connection;
 mod addr_info;
 mod io;
+pub mod metrics;
 mod prefixed;
 pub mod tls;
 
@@ -14,11 +15,7 @@ pub use self::{
         GetOriginalDst,
         SoOriginalDst
     },
-    connect::{
-        Connect,
-        DnsNameAndPort, Host, HostAndPort, HostAndPortError,
-        LookupAddressAndConnect,
-    },
+    connect::Connect,
     connection::{
         BoundPort,
         Connection,

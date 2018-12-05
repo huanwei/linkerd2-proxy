@@ -1,4 +1,5 @@
 #![deny(warnings)]
+#![recursion_limit="128"]
 #[macro_use]
 mod support;
 use self::support::*;
@@ -11,12 +12,12 @@ macro_rules! generate_outbound_dns_limit_test {
     (server: $make_server:path, client: $make_client:path) => {
         #[test]
         fn outbound_dest_limit_does_not_limit_dns() {
-            let _ = env_logger::try_init();
+            let _ = env_logger_init();
             let srv = $make_server().route("/", "hello").run();
             let srv_addr = srv.addr;
 
-            let mut env = config::TestEnv::new();
-            env.put(config::ENV_DESTINATION_CLIENT_CONCURRENCY_LIMIT, "2".to_owned());
+            let mut env = app::config::TestEnv::new();
+            env.put(app::config::ENV_DESTINATION_CLIENT_CONCURRENCY_LIMIT, "2".to_owned());
 
             let ctrl = controller::new();
             let _txs = (1..=3).map(|n| {
@@ -71,7 +72,7 @@ macro_rules! generate_tests {
 
         #[test]
         fn outbound_asks_controller_api() {
-            let _ = env_logger::try_init();
+            let _ = env_logger_init();
             let srv = $make_server().route("/", "hello").route("/bye", "bye").run();
 
             let ctrl = controller::new()
@@ -86,19 +87,19 @@ macro_rules! generate_tests {
 
         #[test]
         fn outbound_dest_concurrency_limit() {
-            let _ = env_logger::try_init();
+            let _ = env_logger_init();
             let srv = $make_server().route("/", "hello").run();
             let srv_addr = srv.addr;
 
-            let mut env = config::TestEnv::new();
+            let mut env = app::config::TestEnv::new();
 
             // Set the maximum number of Destination service resolutions
             // lower than the total router capacity, so we can reach the
             // maximum number of destinations before we start evicting
             // routes.
-            env.put(config::ENV_DESTINATION_CLIENT_CONCURRENCY_LIMIT, "10".to_owned());
-            env.put(config::ENV_OUTBOUND_ROUTER_CAPACITY, "11".to_owned());
-            env.put(config::ENV_OUTBOUND_ROUTER_MAX_IDLE_AGE, "1s".to_owned());
+            env.put(app::config::ENV_DESTINATION_CLIENT_CONCURRENCY_LIMIT, "10".to_owned());
+            env.put(app::config::ENV_OUTBOUND_ROUTER_CAPACITY, "11".to_owned());
+            env.put(app::config::ENV_OUTBOUND_ROUTER_MAX_IDLE_AGE, "1s".to_owned());
 
             let ctrl = controller::new();
             let _txs = (1..=11).map(|n| {
@@ -158,7 +159,7 @@ macro_rules! generate_tests {
 
         #[test]
         fn outbound_reconnects_if_controller_stream_ends() {
-            let _ = env_logger::try_init();
+            let _ = env_logger_init();
 
             let srv = $make_server().route("/recon", "nect").run();
 
@@ -196,16 +197,22 @@ macro_rules! generate_tests {
             })
         }
 
+        fn init_env() -> app::config::TestEnv {
+            let _ = env_logger_init();
+            let mut env = app::config::TestEnv::new();
+
+            // The bind timeout must be high enough to allow a DNS timeout.
+            env.put(app::config::ENV_BIND_TIMEOUT, "1s".to_owned());
+
+            env
+        }
+
         fn outbound_destinations_reset_on_reconnect<F>(f: F)
             where F: Fn() -> Option<pb::destination::Update> + Send + 'static
         {
             use std::thread;
-            let _ = env_logger::try_init();
-            let mut env = config::TestEnv::new();
 
-            // set the bind timeout to 100 ms.
-            env.put(config::ENV_BIND_TIMEOUT, "100ms".to_owned());
-
+            let env = init_env();
             let srv = $make_server().route("/", "hello").run();
             let ctrl = controller::new();
 
@@ -242,11 +249,7 @@ macro_rules! generate_tests {
         #[test]
         #[cfg_attr(not(feature = "flaky_tests"), ignore)]
         fn outbound_times_out() {
-            let _ = env_logger::try_init();
-            let mut env = config::TestEnv::new();
-
-            // set the bind timeout to 100 ms.
-            env.put(config::ENV_BIND_TIMEOUT, "100ms".to_owned());
+            let env = init_env();
 
             let srv = $make_server().route("/hi", "hello").run();
             let ctrl = controller::new();
@@ -268,7 +271,7 @@ macro_rules! generate_tests {
 
         #[test]
         fn outbound_asks_controller_without_orig_dst() {
-            let _ = env_logger::try_init();
+            let _ = init_env();
 
             let srv = $make_server()
                 .route("/", "hello")
@@ -291,7 +294,7 @@ macro_rules! generate_tests {
 
         #[test]
         fn outbound_error_reconnects_after_backoff() {
-            let _ = env_logger::try_init();
+            let mut env = init_env();
 
             let srv = $make_server()
                 .route("/", "hello")
@@ -306,10 +309,7 @@ macro_rules! generate_tests {
             dst_tx.send_addr(srv.addr);
             // but don't drop, to not trigger stream closing reconnects
 
-            let mut env = config::TestEnv::new();
-
-            // set the backoff timeout to 100 ms.
-            env.put(config::ENV_CONTROL_BACKOFF_DELAY, "100ms".to_owned());
+            env.put(app::config::ENV_CONTROL_BACKOFF_DELAY, "100ms".to_owned());
 
             let proxy = proxy::new()
                 .controller(ctrl.delay_listen(rx.map_err(|_| ())))
@@ -367,7 +367,7 @@ mod http1 {
 
 #[test]
 fn outbound_updates_newer_services() {
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
 
     let srv = server::http1().route("/h1", "hello h1").run();
 
@@ -402,7 +402,7 @@ mod proxy_to_proxy {
 
     #[test]
     fn outbound_http1() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
 
         // Instead of a second proxy, this mocked h2 server will be the target.
         let srv = server::http2()
@@ -433,7 +433,7 @@ mod proxy_to_proxy {
 
     #[test]
     fn inbound_http1() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
 
         let srv = server::http1()
             .route_fn("/h1", |req| {

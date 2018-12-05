@@ -8,9 +8,10 @@ use std::{
 };
 
 use futures::{Async, Future, Stream,};
-use tower_h2::{BoxBody, HttpService, RecvBody};
+use tower_http::HttpService;
+use tower_grpc::{Body, BoxBody};
 
-use linkerd2_proxy_api::{
+use api::{
     destination::{
         protocol_hint::Protocol,
         update::Update as PbUpdate2,
@@ -21,17 +22,21 @@ use linkerd2_proxy_api::{
 
 use control::{
     cache::{Cache, CacheChange, Exists},
-    destination::{Metadata, Responder, ProtocolHint, Update},
+    destination::{Metadata, ProtocolHint, Responder, Update},
     remote_stream::Remote,
 };
 use dns::{self, IpAddrListFuture};
-use transport::{tls, DnsNameAndPort};
-use conditional::Conditional;
+use transport::tls;
+use {Conditional, NameAddr};
 
 use super::{ActiveQuery, DestinationServiceQuery, UpdateRx};
 
 /// Holds the state of a single resolution.
-pub(super) struct DestinationSet<T: HttpService<ResponseBody = RecvBody>> {
+pub(super) struct DestinationSet<T>
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+{
     pub addrs: Exists<Cache<SocketAddr, Metadata>>,
     pub query: DestinationServiceQuery<T>,
     pub dns_query: Option<IpAddrListFuture>,
@@ -42,22 +47,23 @@ pub(super) struct DestinationSet<T: HttpService<ResponseBody = RecvBody>> {
 
 impl<T> DestinationSet<T>
 where
-    T: HttpService<RequestBody = BoxBody, ResponseBody = RecvBody>,
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
     T::Error: fmt::Debug,
 {
     pub(super) fn reset_dns_query(
         &mut self,
         dns_resolver: &dns::Resolver,
         deadline: Instant,
-        authority: &DnsNameAndPort,
+        authority: &NameAddr,
     ) {
         trace!(
             "resetting DNS query for {} at {:?}",
-            authority.host,
+            authority.name(),
             deadline
         );
         self.reset_on_next_modification();
-        self.dns_query = Some(dns_resolver.resolve_all_ips(deadline, &authority.host));
+        self.dns_query = Some(dns_resolver.resolve_all_ips(deadline, authority.name()));
     }
 
     // Processes Destination service updates from `request_rx`, returning the new query
@@ -66,7 +72,7 @@ where
     // "no change in existence" instead of "unknown".
     pub(super) fn poll_destination_service(
         &mut self,
-        auth: &DnsNameAndPort,
+        auth: &NameAddr,
         mut rx: UpdateRx<T>,
         tls_controller_namespace: Option<&str>,
     ) -> (ActiveQuery<T>, Exists<()>) {
@@ -122,7 +128,7 @@ where
         }
     }
 
-    pub(super) fn poll_dns(&mut self, dns_resolver: &dns::Resolver, authority: &DnsNameAndPort) {
+    pub(super) fn poll_dns(&mut self, dns_resolver: &dns::Resolver, authority: &NameAddr) {
         // Duration to wait before polling DNS again after an error
         // (or a NXDOMAIN response with no TTL).
         const DNS_ERROR_TTL: Duration = Duration::from_secs(5);
@@ -146,8 +152,8 @@ where
                         authority,
                         ips.iter().map(|ip| {
                             (
-                                SocketAddr::from((ip, authority.port)),
-                                Metadata::no_metadata(),
+                                SocketAddr::from((ip, authority.port())),
+                                Metadata::none(tls::ReasonForNoIdentity::NotProvidedByServiceDiscovery),
                             )
                         }),
                     );
@@ -168,7 +174,7 @@ where
                 Err(e) => {
                     // Do nothing so that the most recent non-error response is used until a
                     // non-error response is received
-                    trace!("DNS resolution failed for {}: {}", &authority.host, e);
+                    trace!("DNS resolution failed for {}: {}", authority.name(), e);
 
                     // Poll again after the default wait time.
                     Instant::now() + DNS_ERROR_TTL
@@ -179,8 +185,11 @@ where
     }
 }
 
-impl<T: HttpService<ResponseBody = RecvBody>> DestinationSet<T> {
-
+impl<T> DestinationSet<T>
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+{
     /// Returns `true` if the authority that created this query _should_ query
     /// the Destination service, but was unable to due to insufficient capaacity.
     pub(super) fn needs_query_capacity(&self) -> bool {
@@ -196,7 +205,7 @@ impl<T: HttpService<ResponseBody = RecvBody>> DestinationSet<T> {
         }
     }
 
-    fn add<A>(&mut self, authority_for_logging: &DnsNameAndPort, addrs_to_add: A)
+    fn add<A>(&mut self, authority_for_logging: &NameAddr, addrs_to_add: A)
     where
         A: Iterator<Item = (SocketAddr, Metadata)>,
     {
@@ -210,7 +219,7 @@ impl<T: HttpService<ResponseBody = RecvBody>> DestinationSet<T> {
         self.addrs = Exists::Yes(cache);
     }
 
-    fn remove<A>(&mut self, authority_for_logging: &DnsNameAndPort, addrs_to_remove: A)
+    fn remove<A>(&mut self, authority_for_logging: &NameAddr, addrs_to_remove: A)
     where
         A: Iterator<Item = SocketAddr>,
     {
@@ -226,7 +235,7 @@ impl<T: HttpService<ResponseBody = RecvBody>> DestinationSet<T> {
         self.addrs = Exists::Yes(cache);
     }
 
-    fn no_endpoints(&mut self, authority_for_logging: &DnsNameAndPort, exists: bool) {
+    fn no_endpoints(&mut self, authority_for_logging: &NameAddr, exists: bool) {
         trace!(
             "no endpoints for {:?} that is known to {}",
             authority_for_logging,
@@ -249,17 +258,17 @@ impl<T: HttpService<ResponseBody = RecvBody>> DestinationSet<T> {
 
     fn on_change(
         responders: &mut Vec<Responder>,
-        authority_for_logging: &DnsNameAndPort,
+        authority_for_logging: &NameAddr,
         change: CacheChange<SocketAddr, Metadata>,
     ) {
         let (update_str, update, addr) = match change {
             CacheChange::Insertion { key, value } => {
-                ("insert", Update::Bind(key, value.clone()), key)
+                ("insert", Update::Add(key, value.clone()), key)
             },
             CacheChange::Removal { key } => ("remove", Update::Remove(key), key),
             CacheChange::Modification { key, new_value } => (
                 "change metadata for",
-                Update::Bind(key, new_value.clone()),
+                Update::Add(key, new_value.clone()),
                 key,
             ),
         };
@@ -329,7 +338,7 @@ fn pb_to_addr_meta(
 }
 
 fn pb_to_sock_addr(pb: TcpAddress) -> Option<SocketAddr> {
-    use linkerd2_proxy_api::net::ip_address::Ip;
+    use api::net::ip_address::Ip;
     use std::net::{Ipv4Addr, Ipv6Addr};
     /*
     current structure is:

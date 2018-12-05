@@ -5,43 +5,34 @@ use std::{
     },
     fmt,
     mem,
-    time::{Instant, Duration},
+    time::Instant,
     sync::Arc,
 };
 use futures::{
-    future,
     sync::mpsc,
-    Async, Future, Poll, Stream,
+    Async, Poll, Stream,
 };
-use tower_grpc as grpc;
-use tower_h2::{BoxBody, HttpService, RecvBody};
+use tower_grpc::{self as grpc, Body, BoxBody};
+use tower_http::HttpService;
 
-use linkerd2_proxy_api::destination::client::Destination;
-use linkerd2_proxy_api::destination::{
+use api::destination::client::Destination;
+use api::destination::{
     GetDestination,
     Update as PbUpdate,
 };
 
 use super::{ResolveRequest, Update};
-use config::Namespaces;
+use app::config::Namespaces;
 use control::{
     cache::Exists,
-    fully_qualified_authority::FullyQualifiedAuthority,
     remote_stream::{Receiver, Remote},
 };
 use dns;
-use transport::{tls, DnsNameAndPort, HostAndPort};
-use conditional::Conditional;
-use watch_service::WatchService;
-use futures_watch::Watch;
+use NameAddr;
 
-mod client;
 mod destination_set;
 
-use self::{
-    client::BindClient,
-    destination_set::DestinationSet,
-};
+use self::destination_set::DestinationSet;
 
 type ActiveQuery<T> = Remote<PbUpdate, T>;
 type UpdateRx<T> = Receiver<PbUpdate, T>;
@@ -52,7 +43,11 @@ type UpdateRx<T> = Receiver<PbUpdate, T>;
 /// service is healthy, it reads requests from `request_rx`, determines how to resolve the
 /// provided authority to a set of addresses, and ensures that resolution updates are
 /// propagated to all requesters.
-struct Background<T: HttpService<ResponseBody = RecvBody>> {
+pub(super) struct Background<T>
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+{
     new_query: NewQuery,
     dns_resolver: dns::Resolver,
     dsts: DestinationCache<T>,
@@ -66,16 +61,21 @@ struct Background<T: HttpService<ResponseBody = RecvBody>> {
 /// Holds the currently active `DestinationSet`s and a list of any destinations
 /// which require reconnects.
 #[derive(Default)]
-struct DestinationCache<T: HttpService<ResponseBody = RecvBody>> {
-    destinations: HashMap<DnsNameAndPort, DestinationSet<T>>,
+struct DestinationCache<T>
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+{
+    destinations: HashMap<NameAddr, DestinationSet<T>>,
     /// A queue of authorities that need to be reconnected.
-    reconnects: VecDeque<DnsNameAndPort>,
+    reconnects: VecDeque<NameAddr>,
 }
 
 /// The configurationn necessary to create a new Destination service
 /// query.
 struct NewQuery {
     namespaces: Namespaces,
+    suffixes: Vec<dns::Suffix>,
     /// Used for counting the number of currently-active queries.
     ///
     /// Each active query will hold a `Weak` reference back to this `Arc`, and
@@ -86,73 +86,33 @@ struct NewQuery {
     concurrency_limit: usize,
 }
 
-enum DestinationServiceQuery<T: HttpService<ResponseBody = RecvBody>> {
+enum DestinationServiceQuery<T>
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+{
     Inactive,
     Active(ActiveQuery<T>),
     NoCapacity,
-}
-
-/// Returns a new discovery background task.
-pub(super) fn task(
-    request_rx: mpsc::UnboundedReceiver<ResolveRequest>,
-    dns_resolver: dns::Resolver,
-    namespaces: Namespaces,
-    host_and_port: Option<HostAndPort>,
-    controller_tls: tls::ConditionalConnectionConfig<tls::ClientConfigWatch>,
-    control_backoff_delay: Duration,
-    concurrency_limit: usize,
-) -> impl Future<Item = (), Error = ()>
-{
-    // Build up the Controller Client Stack
-    let mut client = host_and_port.map(|host_and_port| {
-        let (identity, watch) = match controller_tls {
-            Conditional::Some(config) =>
-                (Conditional::Some(config.server_identity), config.config),
-            Conditional::None(reason) => {
-                // If there's no connection config, then construct a new
-                // `Watch` that never updates to construct the `WatchService`.
-                // We do this here rather than calling `ClientConfig::no_tls`
-                // in order to propagate the reason for no TLS to the watch.
-                let (watch, _) = Watch::new(Conditional::None(reason));
-                (Conditional::None(reason), watch)
-            },
-        };
-        let bind_client = BindClient::new(
-            identity,
-            &dns_resolver,
-            host_and_port,
-            control_backoff_delay,
-        );
-        WatchService::new(watch, bind_client)
-    });
-
-    let mut disco = Background::new(
-        request_rx,
-        dns_resolver,
-        namespaces,
-        concurrency_limit,
-    );
-
-    future::poll_fn(move || {
-        disco.poll_rpc(&mut client)
-    })
 }
 
 // ==== impl Background =====
 
 impl<T> Background<T>
 where
-    T: HttpService<RequestBody = BoxBody, ResponseBody = RecvBody>,
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
     T::Error: fmt::Debug,
 {
-    fn new(
+    pub(super) fn new(
         request_rx: mpsc::UnboundedReceiver<ResolveRequest>,
         dns_resolver: dns::Resolver,
         namespaces: Namespaces,
+        suffixes: Vec<dns::Suffix>,
         concurrency_limit: usize,
     ) -> Self {
         Self {
-            new_query: NewQuery::new(namespaces, concurrency_limit),
+            new_query: NewQuery::new(namespaces, suffixes, concurrency_limit),
             dns_resolver,
             dsts: DestinationCache::new(),
             rpc_ready: false,
@@ -160,7 +120,7 @@ where
         }
     }
 
-   fn poll_rpc(&mut self, client: &mut Option<T>) -> Poll<(), ()> {
+   pub(super) fn poll_rpc(&mut self, client: &mut Option<T>) -> Poll<(), ()> {
         // This loop is make sure any streams that were found disconnected
         // in `poll_destinations` while the `rpc` service is ready should
         // be reconnected now, otherwise the task would just sleep...
@@ -226,7 +186,7 @@ where
                             // them onto the new watch first
                             match occ.get().addrs {
                                 Exists::Yes(ref cache) => for (&addr, meta) in cache {
-                                    let update = Update::Bind(addr, meta.clone());
+                                    let update = Update::Add(addr, meta.clone());
                                     resolve.responder.update_tx
                                         .unbounded_send(update)
                                         .expect("unbounded_send does not fail");
@@ -358,9 +318,10 @@ where
 
 impl NewQuery {
 
-    fn new(namespaces: Namespaces, concurrency_limit: usize) -> Self {
+    fn new(namespaces: Namespaces, suffixes: Vec<dns::Suffix>, concurrency_limit: usize) -> Self {
         Self {
             namespaces,
+            suffixes,
             concurrency_limit,
             active_query_handle: Arc::new(()),
         }
@@ -391,42 +352,38 @@ impl NewQuery {
     fn query_destination_service_if_relevant<T>(
         &self,
         client: Option<&mut T>,
-        auth: &DnsNameAndPort,
+        dst: &NameAddr,
         connect_or_reconnect: &str,
     ) -> DestinationServiceQuery<T>
     where
-        T: HttpService<RequestBody = BoxBody, ResponseBody = RecvBody>,
+        T: HttpService<BoxBody>,
+        T::ResponseBody: Body,
         T::Error: fmt::Debug,
     {
-        trace!(
-            "DestinationServiceQuery {} {:?}",
-            connect_or_reconnect,
-            auth
-        );
-        let default_ns = &self.namespaces.pod;
-        let client_and_authority = client.and_then(|client| {
-            FullyQualifiedAuthority::normalize(auth, default_ns)
-                .map(|auth| (auth, client))
-        });
-        match client_and_authority {
+        trace!("DestinationServiceQuery {} {:?}", connect_or_reconnect, dst);
+        if !self.suffixes.iter().any(|s| s.contains(dst.name())) {
+            debug!("dst={} not in suffixes", dst.name());
+            return DestinationServiceQuery::Inactive;
+        }
+        match client {
             // If we were able to normalize the authority (indicating we should
             // query the Destination service), but we're out of queries, return
             // None and set the "needs query" flag.
-            Some((ref auth, _)) if !self.has_more_queries() => {
+            Some(_) if !self.has_more_queries() => {
                 warn!(
                     "Can't query Destination service for {:?}, maximum \
                      number of queries ({}) reached.",
-                    auth,
+                    dst,
                     self.concurrency_limit,
                 );
                 DestinationServiceQuery::NoCapacity
             },
             // We should query the Destination service and there is sufficient
             // query capacity, so we're good to go!
-            Some((auth, client)) => {
+            Some(client) => {
                 let req = GetDestination {
                     scheme: "k8s".into(),
-                    path: auth.without_trailing_dot().to_owned(),
+                    path: format!("{}", dst),
                 };
                 let mut svc = Destination::new(client.lift_ref());
                 let response = svc.get(grpc::Request::new(req));
@@ -438,7 +395,7 @@ impl NewQuery {
             },
             // This authority should not query the Destination service. Return
             // None, but set the "needs query" flag to false.
-            None => DestinationServiceQuery::Inactive
+            _ => DestinationServiceQuery::Inactive
         }
     }
 
@@ -451,7 +408,8 @@ impl NewQuery {
 
 impl<T> DestinationCache<T>
 where
-    T: HttpService<RequestBody = BoxBody, ResponseBody = RecvBody>,
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
     T::Error: fmt::Debug,
 {
 
@@ -465,7 +423,7 @@ where
     /// Returns true if `auth` is currently known to need a Destination
     /// service query, but was unable to query previously due to the query
     /// limit being reached.
-    fn needs_query_for(&self, auth: &DnsNameAndPort) -> bool {
+    fn needs_query_for(&self, auth: &NameAddr) -> bool {
         self.destinations
             .get(auth)
             .map(|dst| dst.needs_query_capacity())
@@ -485,7 +443,11 @@ where
 
 // ===== impl DestinationServiceQuery =====
 
-impl<T: HttpService<ResponseBody = RecvBody>> DestinationServiceQuery<T> {
+impl<T> DestinationServiceQuery<T>
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+{
 
     pub fn is_active(&self) -> bool {
         match self {
@@ -511,7 +473,8 @@ impl<T: HttpService<ResponseBody = RecvBody>> DestinationServiceQuery<T> {
 
 impl<T> From<ActiveQuery<T>> for DestinationServiceQuery<T>
 where
-    T: HttpService<ResponseBody = RecvBody>,
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
 {
     fn from(active: ActiveQuery<T>) -> Self {
         DestinationServiceQuery::Active(active)

@@ -1,4 +1,5 @@
 #![deny(warnings)]
+#![recursion_limit="128"]
 #[macro_use]
 extern crate log;
 extern crate regex;
@@ -9,12 +10,6 @@ mod support;
 use self::support::*;
 use support::bytes::IntoBuf;
 use std::io::Read;
-
-macro_rules! assert_contains {
-    ($scrape:expr, $contains:expr) => {
-        assert_eventually!($scrape.contains($contains), "metrics scrape:\n{:8}\ndid not contain:\n{:8}", $scrape, $contains)
-    }
-}
 
 struct Fixture {
     client: client::Client,
@@ -114,7 +109,7 @@ impl TcpFixture {
 
 #[test]
 fn metrics_endpoint_inbound_request_count() {
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
     let Fixture { client, metrics, proxy: _proxy } = Fixture::inbound();
 
     // prior to seeing any requests, request count should be empty.
@@ -125,13 +120,13 @@ fn metrics_endpoint_inbound_request_count() {
     assert_eq!(client.get("/"), "hello");
 
     // after seeing a request, the request count should be 1.
-    assert_contains!(metrics.get("/metrics"), "request_total{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"), "request_total{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\"} 1");
 
 }
 
 #[test]
 fn metrics_endpoint_outbound_request_count() {
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
     let Fixture { client, metrics, proxy: _proxy } = Fixture::outbound();
 
     // prior to seeing any requests, request count should be empty.
@@ -142,7 +137,7 @@ fn metrics_endpoint_outbound_request_count() {
     assert_eq!(client.get("/"), "hello");
 
     // after seeing a request, the request count should be 1.
-    assert_contains!(metrics.get("/metrics"), "request_total{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"), "request_total{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
 
 }
 
@@ -170,7 +165,7 @@ mod response_classification {
         no_tls_reason: Option<&str>
     ) -> String {
         format!(
-            "response_total{{authority=\"tele.test.svc.cluster.local\",direction=\"{}\",tls=\"{}\",{}classification=\"{}\",status_code=\"{}\"}} 1",
+            "response_total{{authority=\"tele.test.svc.cluster.local\",direction=\"{}\",tls=\"{}\",{}status_code=\"{}\",classification=\"{}\"}} 1",
             direction,
             tls,
             if let Some(reason) = no_tls_reason {
@@ -178,8 +173,8 @@ mod response_classification {
             } else {
                 String::new()
             },
-            if status.is_server_error() { "failure" } else { "success" },
             status.as_u16(),
+            if status.is_server_error() { "failure" } else { "success" },
         )
     }
 
@@ -204,7 +199,7 @@ mod response_classification {
                 let grpc_status = parse_header(headers, REQ_GRPC_STATUS_HEADER);
                 let mut rsp = if let Some(_grpc_status) = grpc_status {
                     // TODO: tests for grpc statuses
-                    unimplemented!()
+                    unreachable!("not called in test")
                 } else {
                     Response::new("".into())
                 };
@@ -216,7 +211,7 @@ mod response_classification {
 
     #[test]
     fn inbound_http() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy: _proxy } =
             Fixture::inbound_with_server(make_test_server());
 
@@ -231,7 +226,7 @@ mod response_classification {
             for status in &STATUSES[0..i] {
                 // assert that the current status code is incremented, *and* that
                 // all previous requests are *not* incremented.
-                assert_contains!(
+                assert_eventually_contains!(
                     metrics.get("/metrics"),
                     &expected_metric(status, "inbound", "disabled", None)
                 )
@@ -241,7 +236,7 @@ mod response_classification {
 
     #[test]
     fn outbound_http() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy: _proxy } =
             Fixture::outbound_with_server(make_test_server());
 
@@ -256,7 +251,7 @@ mod response_classification {
             for status in &STATUSES[0..i] {
                 // assert that the current status code is incremented, *and* that
                 // all previous requests are *not* incremented.
-                assert_contains!(
+                assert_eventually_contains!(
                     metrics.get("/metrics"),
                     &expected_metric(
                         status,
@@ -277,7 +272,7 @@ mod response_classification {
 #[test]
 #[cfg_attr(not(feature = "flaky_tests"), ignore)]
 fn metrics_endpoint_inbound_response_latency() {
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
 
     info!("running test server");
     let srv = server::new()
@@ -293,11 +288,11 @@ fn metrics_endpoint_inbound_response_latency() {
 
     // assert the >=1000ms bucket is incremented by our request with 500ms
     // extra latency.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"1000\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"1000\"} 1");
     // the histogram's count should be 1.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\"} 1");
     // TODO: we're not going to make any assertions about the
     // response_latency_ms_sum stat, since its granularity depends on the actual
     // observed latencies, which may vary a bit. we could make more reliable
@@ -308,42 +303,42 @@ fn metrics_endpoint_inbound_response_latency() {
     assert_eq!(client.get("/hi"), "good morning");
 
     // request with 40ms extra latency should fall into the 50ms bucket.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"50\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"50\"} 1");
     // 1000ms bucket should be incremented as well, since it counts *all*
     // observations less than or equal to 1000ms, even if they also increment
     // other buckets.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"1000\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"1000\"} 2");
     // the histogram's total count should be 2.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\"} 2");
 
     info!("client.get(/hi)");
     assert_eq!(client.get("/hi"), "good morning");
 
     // request with 40ms extra latency should fall into the 50ms bucket.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"50\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"50\"} 2");
     // 1000ms bucket should be incremented as well.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"1000\"} 3");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"1000\"} 3");
     // the histogram's total count should be 3.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\"} 3");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\"} 3");
 
     info!("client.get(/hey)");
     assert_eq!(client.get("/hey"), "hello");
 
     // 50ms bucket should be un-changed by the request with 500ms latency.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"50\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"50\"} 2");
     // 1000ms bucket should be incremented.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\",le=\"1000\"} 4");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\",le=\"1000\"} 4");
     // the histogram's total count should be 4.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\"} 4");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\"} 4");
 }
 
 // Ignore this test on CI, because our method of adding latency to requests
@@ -353,7 +348,7 @@ fn metrics_endpoint_inbound_response_latency() {
 #[test]
 #[cfg_attr(not(feature = "flaky_tests"), ignore)]
 fn metrics_endpoint_outbound_response_latency() {
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
 
     info!("running test server");
     let srv = server::new()
@@ -369,11 +364,11 @@ fn metrics_endpoint_outbound_response_latency() {
 
     // assert the >=1000ms bucket is incremented by our request with 500ms
     // extra latency.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"1000\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"1000\"} 1");
     // the histogram's count should be 1.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
     // TODO: we're not going to make any assertions about the
     // response_latency_ms_sum stat, since its granularity depends on the actual
     // observed latencies, which may vary a bit. we could make more reliable
@@ -384,42 +379,42 @@ fn metrics_endpoint_outbound_response_latency() {
     assert_eq!(client.get("/hi"), "good morning");
 
     // request with 40ms extra latency should fall into the 50ms bucket.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"50\"} 1");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"50\"} 1");
     // 1000ms bucket should be incremented as well, since it counts *all*
     // bservations less than or equal to 1000ms, even if they also increment
     // other buckets.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"1000\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"1000\"} 2");
     // the histogram's total count should be 2.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 2");
 
     info!("client.get(/hi)");
     assert_eq!(client.get("/hi"), "good morning");
 
     // request with 40ms extra latency should fall into the 50ms bucket.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"50\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"50\"} 2");
     // 1000ms bucket should be incremented as well.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"1000\"} 3");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"1000\"} 3");
     // the histogram's total count should be 3.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 3");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 3");
 
     info!("client.get(/hey)");
     assert_eq!(client.get("/hey"), "hello");
 
     // 50ms bucket should be un-changed by the request with 500ms latency.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"50\"} 2");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"50\"} 2");
     // 1000ms bucket should be incremented.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\",le=\"1000\"} 4");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_bucket{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",le=\"1000\"} 4");
     // the histogram's total count should be 4.
-    assert_contains!(metrics.get("/metrics"),
-        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 4");
+    assert_eventually_contains!(metrics.get("/metrics"),
+        "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"outbound\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 4");
 }
 
 // Tests for destination labels provided by control plane service discovery.
@@ -457,7 +452,7 @@ mod outbound_dst_labels {
 
     #[test]
     fn multiple_addr_labels() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let (Fixture { client, metrics, proxy: _proxy }, addr, dst_tx) =
             fixture("labeled.test.svc.cluster.local");
 
@@ -475,13 +470,13 @@ mod outbound_dst_labels {
         // scrape, because testing for whole metric lines would depend on
         // the order in which the labels occur, and we can't depend on hash
         // map ordering.
-        assert_contains!(metrics.get("/metrics"), "dst_addr_label1=\"foo\"");
-        assert_contains!(metrics.get("/metrics"), "dst_addr_label2=\"bar\"");
+        assert_eventually_contains!(metrics.get("/metrics"), "dst_addr_label1=\"foo\"");
+        assert_eventually_contains!(metrics.get("/metrics"), "dst_addr_label2=\"bar\"");
     }
 
     #[test]
     fn multiple_addrset_labels() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let (Fixture { client, metrics, proxy: _proxy }, addr, dst_tx) =
             fixture("labeled.test.svc.cluster.local");
 
@@ -500,13 +495,13 @@ mod outbound_dst_labels {
         // scrape, because testing for whole metric lines would depend on
         // the order in which the labels occur, and we can't depend on hash
         // map ordering.
-        assert_contains!(metrics.get("/metrics"), "dst_set_label1=\"foo\"");
-        assert_contains!(metrics.get("/metrics"), "dst_set_label2=\"bar\"");
+        assert_eventually_contains!(metrics.get("/metrics"), "dst_set_label1=\"foo\"");
+        assert_eventually_contains!(metrics.get("/metrics"), "dst_set_label2=\"bar\"");
     }
 
     #[test]
     fn labeled_addr_and_addrset() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let (Fixture { client, metrics, proxy: _proxy }, addr, dst_tx) =
             fixture("labeled.test.svc.cluster.local");
 
@@ -520,12 +515,12 @@ mod outbound_dst_labels {
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
     }
 
     // Ignore this test on CI, as it may fail due to the reduced concurrency
@@ -535,7 +530,7 @@ mod outbound_dst_labels {
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn controller_updates_addr_labels() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
                 info!("running test server");
 
         let (Fixture { client, metrics, proxy: _proxy }, addr, dst_tx) =
@@ -552,12 +547,12 @@ mod outbound_dst_labels {
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
         // the first request should be labeled with `dst_addr_label="foo"`
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
 
         {
             let mut alabels = HashMap::new();
@@ -570,19 +565,19 @@ mod outbound_dst_labels {
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
         // the second request should increment stats labeled with `dst_addr_label="bar"`
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"bar\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"bar\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"bar\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"bar\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"bar\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
         // stats recorded from the first request should still be present.
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_addr_label=\"foo\",dst_set_label=\"unchanged\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
     }
 
     // Ignore this test on CI, as it may fail due to the reduced concurrency
@@ -592,7 +587,7 @@ mod outbound_dst_labels {
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn controller_updates_set_labels() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
                 info!("running test server");
         let (Fixture { client, metrics, proxy: _proxy }, addr, dst_tx) =
             fixture("labeled.test.svc.cluster.local");
@@ -607,12 +602,12 @@ mod outbound_dst_labels {
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
         // the first request should be labeled with `dst_addr_label="foo"`
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
 
         {
             let alabels = HashMap::new();
@@ -624,26 +619,26 @@ mod outbound_dst_labels {
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
         // the second request should increment stats labeled with `dst_addr_label="bar"`
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"bar\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
         // stats recorded from the first request should still be present.
-        assert_contains!(metrics.get("/metrics"),
-            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_latency_ms_count{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
             "request_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
-        assert_contains!(metrics.get("/metrics"),
-            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "response_total{authority=\"labeled.test.svc.cluster.local\",direction=\"outbound\",dst_set_label=\"foo\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",status_code=\"200\",classification=\"success\"} 1");
     }
 }
 
 #[test]
 fn metrics_have_no_double_commas() {
     // Test for regressions to linkerd/linkerd2#600.
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
 
     info!("running test server");
     let inbound_srv = server::new().route("/hey", "hello").run();
@@ -696,18 +691,18 @@ mod transport {
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_http_accept() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy } = Fixture::inbound();
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\"} 1"
         );
         // drop the client to force the connection to close.
         drop(client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 1"
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 1"
         );
 
         // create a new client to force a new connection
@@ -715,26 +710,26 @@ mod transport {
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\"} 2"
         );
         // drop the client to force the connection to close.
         drop(client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 2"
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 2"
         );
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_http_connect() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy } = Fixture::inbound();
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_open_total{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_open_total{direction=\"inbound\",peer=\"dst\",tls=\"internal_traffic\"} 1");
 
         // create a new client to force a new connection
         let client = client::new(proxy.inbound, "tele.test.svc.cluster.local");
@@ -742,25 +737,25 @@ mod transport {
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
         // server connection should be pooled
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_open_total{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_open_total{direction=\"inbound\",peer=\"dst\",tls=\"internal_traffic\"} 1");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_http_accept() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy } = Fixture::outbound();
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 1"
         );
         // drop the client to force the connection to close.
         drop(client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 1"
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 1"
         );
 
         // create a new client to force a new connection
@@ -768,25 +763,25 @@ mod transport {
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 2"
         );
         // drop the client to force the connection to close.
         drop(client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 2"
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 2"
         );
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_http_connect() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy } = Fixture::outbound();
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
 
         // create a new client to force a new connection
@@ -795,14 +790,14 @@ mod transport {
         info!("client.get(/)");
         assert_eq!(client2.get("/"), "hello");
         // server connection should be pooled
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\"} 1");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_tcp_connect() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::inbound();
 
@@ -810,7 +805,7 @@ mod transport {
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\"} 1");
     }
 
@@ -818,7 +813,7 @@ mod transport {
     #[cfg(macos)]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_tcp_connect_err() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let srv = tcp::server()
             .accept_fut(move |sock| {
                 drop(sock);
@@ -838,18 +833,18 @@ mod transport {
         assert_eq!(tcp_client.read(), &[]);
         // Connection to the server should be a failure with the EXFULL error
         // code.
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"failure\",errno=\"EXFULL\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"EXFULL\"} 1");
         // Connection from the client should have closed cleanly.
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 1");
     }
 
     #[test]
     #[cfg(macos)]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_connect_err() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let srv = tcp::server()
             .accept_fut(move |sock| {
                 drop(sock);
@@ -869,17 +864,17 @@ mod transport {
         assert_eq!(tcp_client.read(), &[]);
         // Connection to the server should be a failure with the EXFULL error
         // code.
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"failure\",errno=\"EXFULL\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"EXFULL\"} 1");
         // Connection from the client should have closed cleanly.
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 1");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_tcp_accept() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::inbound();
 
@@ -888,30 +883,30 @@ mod transport {
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
 
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\"} 1");
 
         drop(tcp_client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 1");
 
         let tcp_client = client.connect();
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
 
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\"} 2");
         drop(tcp_client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 2");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 2");
     }
 
     // linkerd/linkerd2#831
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_tcp_duration() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::inbound();
 
@@ -922,33 +917,33 @@ mod transport {
         drop(tcp_client);
         // TODO: make assertions about buckets
         let out = metrics.get("/metrics");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 1");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"success\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"\"} 1");
 
         let tcp_client = client.connect();
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
         let out = metrics.get("/metrics");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 1");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"success\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"\"} 1");
 
         drop(tcp_client);
         let out = metrics.get("/metrics");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"src\",tls=\"disabled\",classification=\"success\"} 2");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"success\"} 2");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"src\",tls=\"disabled\",errno=\"\"} 2");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"inbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"\"} 2");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_tcp_write_bytes_total() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::inbound();
         let src_expected = format!(
@@ -967,14 +962,14 @@ mod transport {
         drop(tcp_client);
 
         let out = metrics.get("/metrics");
-        assert_contains!(out, &src_expected);
-        assert_contains!(out, &dst_expected);
+        assert_eventually_contains!(out, &src_expected);
+        assert_eventually_contains!(out, &dst_expected);
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn inbound_tcp_read_bytes_total() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::inbound();
         let src_expected = format!(
@@ -993,13 +988,13 @@ mod transport {
         drop(tcp_client);
 
         let out = metrics.get("/metrics");
-        assert_contains!(out, &src_expected);
-        assert_contains!(out, &dst_expected);    }
+        assert_eventually_contains!(out, &src_expected);
+        assert_eventually_contains!(out, &dst_expected);    }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_connect() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::outbound();
 
@@ -1007,14 +1002,14 @@ mod transport {
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\"} 1");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_accept() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::outbound();
 
@@ -1023,29 +1018,29 @@ mod transport {
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
 
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 1");
 
         drop(tcp_client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 1");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 1");
 
         let tcp_client = client.connect();
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
 
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 2");
         drop(tcp_client);
-        assert_contains!(metrics.get("/metrics"),
-            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 2");
+        assert_eventually_contains!(metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 2");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_duration() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::outbound();
 
@@ -1056,33 +1051,33 @@ mod transport {
         drop(tcp_client);
         // TODO: make assertions about buckets
         let out = metrics.get("/metrics");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 1");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"success\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"\"} 1");
 
         let tcp_client = client.connect();
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
         let out = metrics.get("/metrics");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 1");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"success\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 1");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"\"} 1");
 
         drop(tcp_client);
         let out = metrics.get("/metrics");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",classification=\"success\"} 2");
-        assert_contains!(out,
-            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",classification=\"success\"} 2");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\",errno=\"\"} 2");
+        assert_eventually_contains!(out,
+            "tcp_connection_duration_ms_count{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_http\",errno=\"\"} 2");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_write_bytes_total() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::outbound();
         let src_expected = format!(
@@ -1101,14 +1096,14 @@ mod transport {
         drop(tcp_client);
 
         let out = metrics.get("/metrics");
-        assert_contains!(out, &src_expected);
-        assert_contains!(out, &dst_expected);
+        assert_eventually_contains!(out, &src_expected);
+        assert_eventually_contains!(out, &dst_expected);
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_read_bytes_total() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::outbound();
         let src_expected = format!(
@@ -1127,14 +1122,14 @@ mod transport {
         drop(tcp_client);
 
         let out = metrics.get("/metrics");
-        assert_contains!(out, &src_expected);
-        assert_contains!(out, &dst_expected);
+        assert_eventually_contains!(out, &src_expected);
+        assert_eventually_contains!(out, &dst_expected);
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_tcp_open_connections() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let TcpFixture { client, metrics, proxy: _proxy } =
             TcpFixture::outbound();
 
@@ -1142,37 +1137,37 @@ mod transport {
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 1");
         drop(tcp_client);
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 0");
         let tcp_client = client.connect();
 
         tcp_client.write(TcpFixture::HELLO_MSG);
         assert_eq!(tcp_client.read(), TcpFixture::BYE_MSG.as_bytes());
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 1");
 
         drop(tcp_client);
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 0");
     }
 
     #[test]
     #[cfg_attr(not(feature = "flaky_tests"), ignore)]
     fn outbound_http_tcp_open_connections() {
-        let _ = env_logger::try_init();
+        let _ = env_logger_init();
         let Fixture { client, metrics, proxy } =
             Fixture::outbound();
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
 
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 1");
         drop(client);
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 0");
 
         // create a new client to force a new connection
@@ -1180,11 +1175,11 @@ mod transport {
 
         info!("client.get(/)");
         assert_eq!(client.get("/"), "hello");
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 1");
 
         drop(client);
-        assert_contains!(metrics.get("/metrics"),
+        assert_eventually_contains!(metrics.get("/metrics"),
             "tcp_open_connections{direction=\"outbound\",peer=\"src\",tls=\"internal_traffic\"} 0");
     }
 }
@@ -1193,7 +1188,7 @@ mod transport {
 #[test]
 #[cfg_attr(not(feature = "flaky_tests"), ignore)]
 fn metrics_compression() {
-    let _ = env_logger::try_init();
+    let _ = env_logger_init();
 
     let Fixture { client, metrics, proxy: _proxy } = Fixture::inbound();
 
@@ -1243,15 +1238,15 @@ fn metrics_compression() {
     assert_eq!(client.get("/"), "hello");
 
     for &encoding in encodings {
-        assert_contains!(do_scrape(encoding),
-            "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\"} 1");
+        assert_eventually_contains!(do_scrape(encoding),
+            "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\"} 1");
     }
 
     info!("client.get(/)");
     assert_eq!(client.get("/"), "hello");
 
     for &encoding in encodings {
-        assert_contains!(do_scrape(encoding),
-            "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",classification=\"success\",status_code=\"200\"} 2");
+        assert_eventually_contains!(do_scrape(encoding),
+            "response_latency_ms_count{authority=\"tele.test.svc.cluster.local\",direction=\"inbound\",tls=\"disabled\",status_code=\"200\"} 2");
     }
 }

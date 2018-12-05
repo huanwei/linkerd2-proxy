@@ -57,6 +57,19 @@ impl Proxy {
         self
     }
 
+    /// Adjust the server's 'addr'. This won't actually re-bind the server,
+    /// it will just affect what the proxy think is the so_original_dst.
+    ///
+    /// This address is bogus, but the proxy should properly ignored the IP
+    /// and only use the port combined with 127.0.0.1 to still connect to
+    /// the server.
+    pub fn inbound_fuzz_addr(self, mut s: server::Listening) -> Self {
+        let old_addr = s.addr;
+        let new_addr = ([10, 1, 2, 3], old_addr.port()).into();
+        s.addr = new_addr;
+        self.inbound(s)
+    }
+
     pub fn outbound(mut self, s: server::Listening) -> Self {
         self.outbound = Some(s);
         self
@@ -85,10 +98,10 @@ impl Proxy {
     }
 
     pub fn run(self) -> Listening {
-        self.run_with_test_env(config::TestEnv::new())
+        self.run_with_test_env(app::config::TestEnv::new())
     }
 
-    pub fn run_with_test_env(self, env: config::TestEnv) -> Listening {
+    pub fn run_with_test_env(self, env: app::config::TestEnv) -> Listening {
         run(self, env)
     }
 }
@@ -104,8 +117,8 @@ struct DstInner {
     outbound_local_addr: Option<SocketAddr>,
 }
 
-impl linkerd2_proxy::GetOriginalDst for MockOriginalDst {
-    fn get_original_dst(&self, sock: &AddrInfo) -> Option<SocketAddr> {
+impl linkerd2_proxy::transport::GetOriginalDst for MockOriginalDst {
+    fn get_original_dst(&self, sock: &transport::AddrInfo) -> Option<SocketAddr> {
         sock.local_addr()
             .ok()
             .and_then(|local| {
@@ -122,27 +135,27 @@ impl linkerd2_proxy::GetOriginalDst for MockOriginalDst {
 }
 
 
-fn run(proxy: Proxy, mut env: config::TestEnv) -> Listening {
-    use self::linkerd2_proxy::config;
+fn run(proxy: Proxy, mut env: app::config::TestEnv) -> Listening {
+    use self::linkerd2_proxy::app;
 
     let controller = proxy.controller.unwrap_or_else(|| controller::new().run());
     let inbound = proxy.inbound;
     let outbound = proxy.outbound;
     let mut mock_orig_dst = DstInner::default();
 
-    env.put(config::ENV_CONTROL_URL, format!("tcp://{}", controller.addr));
-    env.put(config::ENV_PRIVATE_LISTENER, "tcp://127.0.0.1:0".to_owned());
+    env.put(app::config::ENV_CONTROL_URL, format!("tcp://{}", controller.addr));
+    env.put(app::config::ENV_OUTBOUND_LISTENER, "tcp://127.0.0.1:0".to_owned());
     if let Some(ref inbound) = inbound {
-        env.put(config::ENV_PRIVATE_FORWARD, format!("tcp://{}", inbound.addr));
+        env.put(app::config::ENV_INBOUND_FORWARD, format!("tcp://{}", inbound.addr));
         mock_orig_dst.inbound_orig_addr = Some(inbound.addr);
     }
     if let Some(ref outbound) = outbound {
         mock_orig_dst.outbound_orig_addr = Some(outbound.addr);
     }
-    env.put(config::ENV_PUBLIC_LISTENER, "tcp://127.0.0.1:0".to_owned());
-    env.put(config::ENV_CONTROL_LISTENER, "tcp://127.0.0.1:0".to_owned());
-    env.put(config::ENV_METRICS_LISTENER, "tcp://127.0.0.1:0".to_owned());
-    env.put(config::ENV_POD_NAMESPACE, "test".to_owned());
+    env.put(app::config::ENV_INBOUND_LISTENER, "tcp://127.0.0.1:0".to_owned());
+    env.put(app::config::ENV_CONTROL_LISTENER, "tcp://127.0.0.1:0".to_owned());
+    env.put(app::config::ENV_METRICS_LISTENER, "tcp://127.0.0.1:0".to_owned());
+    env.put(app::config::ENV_POD_NAMESPACE, "test".to_owned());
 
     if let Some(ports) = proxy.inbound_disable_ports_protocol_detection {
         let ports = ports.into_iter()
@@ -150,7 +163,7 @@ fn run(proxy: Proxy, mut env: config::TestEnv) -> Listening {
             .collect::<Vec<_>>()
             .join(",");
         env.put(
-            config::ENV_INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
+            app::config::ENV_INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
             ports
         );
     }
@@ -161,12 +174,12 @@ fn run(proxy: Proxy, mut env: config::TestEnv) -> Listening {
             .collect::<Vec<_>>()
             .join(",");
         env.put(
-            config::ENV_OUTBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
+            app::config::ENV_OUTBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
             ports
         );
     }
 
-    let config = config::Config::try_from(&env).unwrap();
+    let config = app::config::Config::try_from(&env).unwrap();
 
     let (running_tx, running_rx) = oneshot::channel();
     let (tx, mut rx) = shutdown_signal();
@@ -185,7 +198,7 @@ fn run(proxy: Proxy, mut env: config::TestEnv) -> Listening {
             // TODO: a mock timer could be injected here?
             let runtime = tokio::runtime::current_thread::Runtime::new()
                 .expect("initialize main runtime");
-            let main = linkerd2_proxy::Main::new(
+            let main = linkerd2_proxy::app::Main::new(
                 config,
                 mock_orig_dst.clone(),
                 runtime,

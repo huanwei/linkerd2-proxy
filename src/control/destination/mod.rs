@@ -24,35 +24,32 @@
 //! - We need some means to limit the number of endpoints that can be returned for a
 //!   single resolution so that `control::Cache` is not effectively unbounded.
 
-use indexmap::IndexMap;
-use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
-use std::time::Duration;
-
 use futures::{
+    future,
     sync::mpsc,
-    Future,
     Async,
+    Future,
     Poll,
     Stream
 };
-use http;
-use tower_discover::{Change, Discover};
-use tower_service::Service;
+use indexmap::IndexMap;
+use std::fmt;
+use std::sync::{Arc, Weak};
+use tower_http::HttpService;
+use tower_grpc::{Body, BoxBody};
 
 use dns;
-use tls;
-use transport::{DnsNameAndPort, HostAndPort};
+use transport::tls;
+use proxy::resolve::{self, Resolve, Update};
 
 pub mod background;
-mod endpoint;
 
-pub use self::endpoint::Endpoint;
-use config::Namespaces;
-use conditional::Conditional;
+use app::config::Namespaces;
+use self::background::Background;
+use {Conditional, NameAddr};
 
 /// A handle to request resolutions from the background discovery task.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Resolver {
     request_tx: mpsc::UnboundedSender<ResolveRequest>,
 }
@@ -60,7 +57,7 @@ pub struct Resolver {
 /// Requests that resolution updaes for `authority` be sent on `responder`.
 #[derive(Debug)]
 struct ResolveRequest {
-    authority: DnsNameAndPort,
+    authority: NameAddr,
     responder: Responder,
 }
 
@@ -68,26 +65,22 @@ struct ResolveRequest {
 #[derive(Debug)]
 struct Responder {
     /// Sends updates from the controller to a `Resolution`.
-    update_tx: mpsc::UnboundedSender<Update>,
+    update_tx: mpsc::UnboundedSender<Update<Metadata>>,
 
     /// Indicates whether the corresponding `Resolution` is still active.
     active: Weak<()>,
 }
 
-/// A `tower_discover::Discover`, given to a `tower_balance::Balance`.
 #[derive(Debug)]
-pub struct Resolution<B> {
+pub struct Resolution {
     /// Receives updates from the controller.
-    update_rx: mpsc::UnboundedReceiver<Update>,
+    update_rx: mpsc::UnboundedReceiver<Update<Metadata>>,
 
     /// Allows `Responder` to detect when its `Resolution` has been lost.
     ///
     /// `Responder` holds a weak reference to this `Arc` and can determine when this
     /// reference has been dropped.
     _active: Arc<()>,
-
-    /// Binds an update endpoint to a Service.
-    bind: B,
 }
 
 /// Metadata describing an endpoint.
@@ -113,73 +106,44 @@ pub enum ProtocolHint {
     Http2,
 }
 
-#[derive(Debug, Clone)]
-enum Update {
-    /// Indicates that an endpoint should be bound to `SocketAddr` with the
-    /// provided `Metadata`.
-    ///
-    /// If there was already an endpoint in the load balancer for this
-    /// address, it should be replaced with the new one.
-    Bind(SocketAddr, Metadata),
-    /// Indicates that the endpoint for this `SocketAddr` should be removed.
-    Remove(SocketAddr),
-}
-
-/// Bind a `SocketAddr` with a protocol.
-pub trait Bind {
-    /// The type of endpoint upon which a `Service` is bound.
-    type Endpoint;
-
-    /// Requests handled by the discovered services
-    type Request;
-
-    /// Responses given by the discovered services
-    type Response;
-
-    /// Errors produced by the discovered services
-    type Error;
-
-    type BindError;
-
-    /// The discovered `Service` instance.
-    type Service: Service<Request = Self::Request, Response = Self::Response, Error = Self::Error>;
-
-    /// Bind a service from an endpoint.
-    fn bind(&self, addr: &Self::Endpoint) -> Result<Self::Service, Self::BindError>;
-}
-
 /// Returns a `Resolver` and a background task future.
 ///
 /// The `Resolver` is used by a listener to request resolutions, while
 /// the background future is executed on the controller thread's executor
 /// to drive the background task.
-pub fn new(
+pub fn new<T>(
+    mut client: Option<T>,
     dns_resolver: dns::Resolver,
     namespaces: Namespaces,
-    host_and_port: Option<HostAndPort>,
-    controller_tls: tls::ConditionalConnectionConfig<tls::ClientConfigWatch>,
-    control_backoff_delay: Duration,
+    suffixes: Vec<dns::Suffix>,
     concurrency_limit: usize,
-) -> (Resolver, impl Future<Item = (), Error = ()>) {
+) -> (Resolver, impl Future<Item = (), Error = ()>)
+where
+    T: HttpService<BoxBody>,
+    T::ResponseBody: Body,
+    T::Error: fmt::Debug,
+{
     let (request_tx, rx) = mpsc::unbounded();
     let disco = Resolver { request_tx };
-    let bg = background::task(
+    let mut bg = Background::new(
         rx,
         dns_resolver,
         namespaces,
-        host_and_port,
-        controller_tls,
-        control_backoff_delay,
+        suffixes,
         concurrency_limit,
     );
-    (disco, bg)
+    let task = future::poll_fn(move || bg.poll_rpc(&mut client));
+    (disco, task)
 }
 
 // ==== impl Resolver =====
 
-impl Resolver {
+impl Resolve<NameAddr> for Resolver {
+    type Endpoint = Metadata;
+    type Resolution = Resolution;
+
     /// Start watching for address changes for a certain authority.
-    pub fn resolve<B>(&self, authority: &DnsNameAndPort, bind: B) -> Resolution<B> {
+    fn resolve(&self, authority: &NameAddr) -> Resolution {
         trace!("resolve; authority={:?}", authority);
         let (update_tx, update_rx) = mpsc::unbounded();
         let active = Arc::new(());
@@ -200,47 +164,18 @@ impl Resolver {
         Resolution {
             update_rx,
             _active: active,
-            bind,
         }
     }
 }
 
-// ==== impl Resolution =====
+impl resolve::Resolution for Resolution {
+    type Endpoint = Metadata;
+    type Error = ();
 
-impl<B, A> Discover for Resolution<B>
-where
-    B: Bind<Endpoint = Endpoint, Request = http::Request<A>>,
-{
-    type Key = SocketAddr;
-    type Request = B::Request;
-    type Response = B::Response;
-    type Error = B::Error;
-    type Service = B::Service;
-    type DiscoverError = ();
-
-    fn poll(&mut self) -> Poll<Change<Self::Key, Self::Service>, Self::DiscoverError> {
-        loop {
-            let up = self.update_rx.poll();
-            trace!("watch: {:?}", up);
-            let update = try_ready!(up).expect("destination stream must be infinite");
-
-            match update {
-                Update::Bind(addr, meta) => {
-                    // We expect the load balancer to handle duplicate inserts
-                    // by replacing the old endpoint with the new one, so
-                    // insertions of new endpoints and metadata changes for
-                    // existing ones can be handled in the same way.
-                    let endpoint = Endpoint::new(addr, meta);
-
-                    let service = self.bind.bind(&endpoint).map_err(|_| ())?;
-
-                    return Ok(Async::Ready(Change::Insert(addr, service)));
-                },
-                Update::Remove(addr) => {
-                    return Ok(Async::Ready(Change::Remove(addr)));
-                },
-            }
-        }
+    fn poll(&mut self) -> Poll<Update<Self::Endpoint>, Self::Error> {
+        let up = try_ready!(self.update_rx.poll())
+            .expect("resolution stream must be infinite");
+        Ok(Async::Ready(up))
     }
 }
 
@@ -255,14 +190,11 @@ impl Responder {
 // ===== impl Metadata =====
 
 impl Metadata {
-    /// Construct a Metadata struct representing an endpoint with no metadata.
-    pub fn no_metadata() -> Self {
+    pub fn none(tls: tls::ReasonForNoIdentity) -> Self {
         Self {
             labels: IndexMap::default(),
             protocol_hint: ProtocolHint::Unknown,
-            // If we have no metadata on an endpoint, assume it does not support TLS.
-            tls_identity:
-                Conditional::None(tls::ReasonForNoIdentity::NotProvidedByServiceDiscovery),
+            tls_identity: Conditional::None(tls),
         }
     }
 
@@ -289,5 +221,9 @@ impl Metadata {
 
     pub fn tls_identity(&self) -> Conditional<&tls::Identity, tls::ReasonForNoIdentity> {
         self.tls_identity.as_ref()
+    }
+
+    pub fn tls_status(&self) -> tls::Status {
+        self.tls_identity().map(|_| ())
     }
 }

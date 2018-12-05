@@ -11,11 +11,14 @@ use self::tokio::{
     net::TcpStream,
     io::{AsyncRead, AsyncWrite},
 };
+use support::hyper::body::Payload;
 
 type Request = http::Request<Bytes>;
-type Response = http::Response<BodyStream>;
-type BodyStream = Box<Stream<Item=Bytes, Error=String> + Send>;
+type Response = http::Response<BytesBody>;
 type Sender = mpsc::UnboundedSender<(Request, oneshot::Sender<Result<Response, String>>)>;
+
+#[derive(Debug)]
+pub struct BytesBody(hyper::Body);
 
 pub fn new<T: Into<String>>(addr: SocketAddr, auth: T) -> Client {
     http2(addr, auth.into())
@@ -84,9 +87,7 @@ impl Client {
     }
 
     pub fn request_async(&self, builder: &mut http::request::Builder) -> Box<Future<Item=Response, Error=String> + Send> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.unbounded_send((builder.body(Bytes::new()).unwrap(), tx));
-        Box::new(rx.then(|oneshot_result| oneshot_result.expect("request canceled")))
+        self.send_req(builder.body(Bytes::new()).unwrap())
     }
 
     pub fn request(&self, builder: &mut http::request::Builder) -> Response {
@@ -96,12 +97,13 @@ impl Client {
     }
 
     pub fn request_body(&self, req: Request) -> Response {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.unbounded_send((req, tx));
-        rx
-            .then(|oneshot_result| oneshot_result.expect("request canceled"))
+        self.send_req(req)
             .wait()
             .expect("response")
+    }
+
+    pub fn request_body_async(&self, req: Request) -> Box<Future<Item=Response, Error=String> + Send> {
+        self.send_req(req)
     }
 
     pub fn request_builder(&self, path: &str) -> http::request::Builder {
@@ -109,6 +111,16 @@ impl Client {
         b.uri(format!("http://{}{}", self.authority, path).as_str())
             .version(self.version);
         b
+    }
+
+    fn send_req(&self, mut req: Request) -> Box<Future<Item=Response, Error=String> + Send> {
+        if req.uri().scheme_part().is_none() {
+            let absolute = format!("http://{}{}", self.authority, req.uri().path()).parse().unwrap();
+            *req.uri_mut() = absolute;
+        }
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.unbounded_send((req, tx));
+        Box::new(rx.then(|oneshot_result| oneshot_result.expect("request canceled")))
     }
 
     pub fn wait_for_closed(self) {
@@ -146,61 +158,28 @@ fn run(addr: SocketAddr, version: Run) -> (Sender, Running) {
             absolute_uris,
         };
 
-        let work: Box<Future<Item=(), Error=()>> = match version {
-            Run::Http1 { .. } => {
-                let client = hyper::Client::builder()
-                    .build::<Conn, hyper::Body>(conn);
-                Box::new(rx.for_each(move |(req, cb)| {
-                    let req = req.map(hyper::Body::from);
-                    let fut = client.request(req).then(move |result| {
-                        let result = result
-                            .map(|res| {
-                                let res = http::Response::from(res);
-                                res.map(|body| -> BodyStream {
-                                    Box::new(body.map(|chunk| chunk.into())
-                                        .map_err(|e| e.to_string()))
-                                })
-                            })
-                            .map_err(|e| e.to_string());
-                        let _ = cb.send(result);
-                        Ok(())
-                    });
-                    current_thread::TaskExecutor::current().execute(fut)
-                        .map_err(|e| println!("client spawn error: {:?}", e))
-                })
-                    .map_err(|e| println!("client error: {:?}", e)))
-            },
-            Run::Http2 => {
-                let connect = tower_h2::client::Connect::new(
-                    conn,
-                    Default::default(),
-                    LazyExecutor,
-                );
-
-                Box::new(connect.new_service()
-                    .map_err(move |err| println!("connect error ({:?}): {:?}", addr, err))
-                    .and_then(move |mut h2| {
-                        rx.for_each(move |(req, cb)| {
-                            let req = req.map(|s| assert!(s.is_empty(), "h2 test client doesn't support bodies yet"));
-                            let fut = h2.call(req).then(|result| {
-                                let result = result
-                                    .map(|res| {
-                                        res.map(|body| -> BodyStream {
-                                            Box::new(RecvBodyStream(body).map_err(|e| format!("{:?}", e)))
-                                        })
-                                    })
-                                    .map_err(|e| format!("{:?}", e));
-                                let _ = cb.send(result);
-                                Ok(())
-                            });
-                            current_thread::TaskExecutor::current().execute(fut)
-                                .map_err(|e| println!("client spawn error: {:?}", e))
-                        })
-                    })
-                    .map(|_| ())
-                    .map_err(|e| println!("client error: {:?}", e)))
-            }
+        let http2_only = match version {
+            Run::Http1 { .. } => false,
+            Run::Http2 => true,
         };
+
+        let client = hyper::Client::builder()
+            .http2_only(http2_only)
+            .build::<Conn, hyper::Body>(conn);
+
+        let work = rx.for_each(move |(req, cb)| {
+            let req = req.map(hyper::Body::from);
+            let fut = client.request(req).then(move |result| {
+                let result = result
+                    .map(|resp| resp.map(BytesBody))
+                    .map_err(|e| e.to_string());
+                let _ = cb.send(result);
+                Ok(())
+            });
+            current_thread::TaskExecutor::current().execute(fut)
+                .map_err(|e| println!("client spawn error: {:?}", e))
+        })
+            .map_err(|e| println!("client error: {:?}", e));
 
         runtime.block_on(work).expect("support client runtime");
     }).unwrap();
@@ -287,6 +266,28 @@ impl AsyncRead for RunningIo {}
 impl AsyncWrite for RunningIo {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         AsyncWrite::shutdown(&mut self.inner)
+    }
+}
+
+impl BytesBody {
+    pub fn poll_data(&mut self) -> Poll<Option<Bytes>, hyper::Error> {
+        match try_ready!(self.0.poll_data()) {
+            Some(chunk) => Ok(Async::Ready(Some(chunk.into()))),
+            None => Ok(Async::Ready(None)),
+        }
+    }
+
+    pub fn poll_trailers(&mut self) -> Poll<Option<http::HeaderMap>, hyper::Error> {
+        self.0.poll_trailers()
+    }
+}
+
+impl Stream for BytesBody {
+    type Item = Bytes;
+    type Error = hyper::Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.poll_data()
     }
 }
 
